@@ -73,7 +73,7 @@
 	    fog: {type:'float', default: 0, min: 0, max: 1},
 
 	    flatShading: {default: false},
-	    playArea: {type: 'float', default: 1, min: 0.5, max: 10},
+	    playArea: {type: 'float', default: 1, min: 1, max: 100},
 
 	    ground: {default: 'hills', oneOf:['none', 'flat', 'hills', 'canyon', 'spikes', 'noise']},
 	    groundYScale: {type: 'float', default: 3, min: 0, max: 50},
@@ -202,7 +202,6 @@
 	    this.sky = document.createElement('a-sky');
 	    this.sky.setAttribute('radius', this.STAGE_SIZE);
 	    this.sky.setAttribute('theta-length', 110);
-	    this.sky.classList.add('environment');
 
 	    // stars are created when needed
 	    this.stars = null;
@@ -212,7 +211,6 @@
 	    this.ground = document.createElement('a-entity');
 	    this.ground.setAttribute('rotation', '-90 0 0');
 	    this.ground.classList.add('environmentGround');
-	    this.ground.classList.add('environment');
 	    this.groundCanvas = null;
 	    this.groundTexture = null;
 	    this.groundMaterial = null;
@@ -220,14 +218,21 @@
 
 	    this.dressing = document.createElement('a-entity');
 	    this.dressing.classList.add('environmentDressing');
-	    this.dressing.classList.add('environment');
+
+	    // add static-body component to the ground if physics available
+	    const physicsAvail = !!this.el.sceneEl.getAttribute('physics');
+	    if (physicsAvail) {
+	        this.ground.setAttribute('static-body', 'shape', 'none');
+	        // Specifying hull as shape works but is slow. We create
+	        // a Heightfield shape at the same time as modifying the plane
+	        // geometry and attach it to the body.
+	    }
 
 	    this.gridCanvas = null;
 	    this.gridTexture = null;
 
 	    // create lights (one ambient hemisphere light, and one directional for the sun)
 	    this.hemilight = document.createElement('a-entity');
-	    this.hemilight.classList.add('environment');
 	    this.hemilight.setAttribute('position', '0 50 0');
 	    this.hemilight.setAttribute('light', {
 	      type: 'hemisphere',
@@ -235,7 +240,6 @@
 	      intensity: 0.4
 	    });
 	    this.sunlight = document.createElement('a-entity');
-	    this.sunlight.classList.add('environment');
 	    this.sunlight.setAttribute('position', this.data.lightPosition);
 	    this.sunlight.setAttribute('light', {intensity: 0.6});
 
@@ -368,9 +372,12 @@
 	    }
 
 	    // scene lights
-	    this.sunlight.setAttribute('light', {type: this.data.lighting == 'point' ? 'point' : 'directional'});
-	    this.sunlight.setAttribute('visible', this.data.lighting !== 'none');
-	    this.hemilight.setAttribute('visible', this.data.lighting !== 'none');
+	    if (this.data.lighting !== oldData.lighting) {
+	      this.sunlight.setAttribute('light', {type: this.data.lighting == 'point' ? 'point' : 'directional'});
+	      this.sunlight.setAttribute('visible', this.data.lighting !== 'none');
+	      this.hemilight.setAttribute('visible', this.data.lighting !== 'none');
+	    }
+
 
 	    // check if ground geometry needs to be calculated
 	    var updateGroundGeometry =
@@ -511,14 +518,26 @@
 	        return;
 	      }
 
+	      var segments = resolution - 1;
+	      var planeSize = this.STAGE_SIZE + 2;
+	      var planeSizeHalf = planeSize / 2;
+	      var segmentSize = planeSize / segments;
 	      if (!this.groundGeometry) {
-	        this.groundGeometry = new THREE.PlaneGeometry(this.STAGE_SIZE + 2, this.STAGE_SIZE + 2, resolution - 1, resolution - 1);
+	        this.groundGeometry = new THREE.PlaneGeometry(planeSize, planeSize, segments, segments);
 	      }
 	      var perlin = new PerlinNoise();
 	      var verts = this.groundGeometry.vertices;
 	      var numVerts = this.groundGeometry.vertices.length;
 	      var frequency = 10;
 	      var inc = frequency / resolution;
+	      var physicsAvail = !!this.el.sceneEl.getAttribute('physics');
+	      if (physicsAvail) {
+	        var maxH = 0;
+	        var matrix = [];
+	        for (var j = 0; j < resolution; j++) {
+	          matrix.push(new Float32Array(resolution));
+	        }
+	      }
 
 	      for (var i = 0, x = 0, y = 0; i < numVerts; i++) {
 	        if (this.data.ground == 'flat') {
@@ -556,10 +575,19 @@
 	        xx = Math.max(0, Math.min(1, (Math.abs(xx) - (pa - 0.9)) * (1 / pa) ));
 	        yy = Math.max(0, Math.min(1, (Math.abs(yy) - (pa - 0.9)) * (1 / pa) ));
 	        h *= xx > yy ? xx : yy;
-	        if (h < 0.01) h = 0; // stick to the floor
 
 	        // set height
 	        verts[i].z = h;
+
+	        // construct matrix to create the Heightfield
+	        if (physicsAvail) {
+	          // We reverse the calculation that is done when creating the
+	          // PlaneGeometry to get back the original x and y for the matrix.
+	          matrix[Math.round((verts[i].x + planeSizeHalf) / segmentSize)][Math.round((verts[i].y + planeSizeHalf) / segmentSize)] = h * this.data.groundYScale;
+	          if (h > maxH) {
+	            maxH = h;
+	          }
+	        }
 
 	        // calculate next x,y ground coordinates
 	        x += inc;
@@ -567,6 +595,27 @@
 	          x = 0;
 	          y += inc;
 	        }
+	      }
+
+
+	      if (physicsAvail) {
+	        // Create the heightfield
+	        var hfShape = new CANNON.Heightfield(matrix, {
+	          elementSize: segmentSize,
+	          minValue: 0,
+	          maxValue: maxH * this.data.groundYScale
+	        });
+	        hfShape.offset = new THREE.Vector3(-planeSize / 2, -planeSize / 2, 0);
+	        this.ground.addEventListener('body-loaded', () => {
+	          this.ground.body.addShape(hfShape, hfShape.offset, hfShape.orientation);
+	          // Show wireframe
+	          if (this.el.sceneEl.systems.physics.debug) {
+	            var bodyComponent = this.ground.components['static-body'];
+	            var createWireframe = bodyComponent.createWireframe.bind(bodyComponent);
+	            createWireframe(this.ground.body, hfShape);
+	            this.el.sceneEl.object3D.add(bodyComponent.wireframe);
+	          }
+	        });
 	      }
 
 	      this.groundGeometry.computeFaceNormals();
@@ -608,20 +657,12 @@
 
 	      // ground material diffuse map is the regular ground texture and the grid texture
 	      // is used in the emissive map. This way, the grid is always equally visible, even at night.
-	      this.groundMaterialProps = {
+	      this.groundMaterial = new THREE.MeshLambertMaterial({
 	        map: this.groundTexture,
 	        emissive: new THREE.Color(0xFFFFFF),
-	        emissiveMap: this.gridTexture
-	      };
-
-	      // use .shading for A-Frame < 0.7.0 and .flatShading for A-Frame >= 0.7.0
-	      if (new THREE.Material().hasOwnProperty('shading')) {
-	        this.groundMaterialProps.shading = this.data.flatShading ? THREE.FlatShading : THREE.SmoothShading;
-	      } else {
-	        this.groundMaterialProps.flatShading = this.data.flatShading;
-	      }
-
-	      this.groundMaterial = new THREE.MeshLambertMaterial(this.groundMaterialProps);
+	        emissiveMap: this.gridTexture,
+	        shading: this.data.flatShading ? THREE.FlatShading : THREE.SmoothShading
+	      });
 	    }
 
 	    var groundctx = this.groundCanvas.getContext('2d');
